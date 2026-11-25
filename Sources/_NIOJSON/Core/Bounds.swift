@@ -232,11 +232,8 @@ extension JSONToken.Number {
   /// Parses a `Double` from a Span
   /// Assumes the length is checked against the bounds `self`
   internal func makeDouble(from span: Span<UInt8>) -> Double {
-    if isInteger {
-      return strtoiSpan(span, start: start.byteOffset, length: byteLength)
-    } else {
-      return strtodSpan(span, start: start.byteOffset, length: byteLength)
-    }
+    let start = start.byteOffset
+    return parseDouble(length: byteLength) { span[start &+ $0] }
   }
 
   internal func makeInt(from span: Span<UInt8>) -> Int? {
@@ -247,11 +244,8 @@ extension JSONToken.Number {
   /// Parses a `Double` from an Array
   /// Assumes the length is checked against the bounds `self`
   internal func makeDouble(from bytes: [UInt8]) -> Double {
-    if isInteger {
-      return strtoiArray(bytes, start: start.byteOffset, length: byteLength)
-    } else {
-      return strtodArray(bytes, start: start.byteOffset, length: byteLength)
-    }
+    let start = start.byteOffset
+    return parseDouble(length: byteLength) { bytes[start &+ $0] }
   }
 
   internal func makeInt(from bytes: [UInt8]) -> Int? {
@@ -262,206 +256,96 @@ extension JSONToken.Number {
 
 public struct UTF8ParsingError: Error {}
 
-// MARK: - Span-based strtoi/strtod
+// MARK: - Double Parsing
 
-private func strtoiSpan(_ span: Span<UInt8>, start: Int, length: Int) -> Double {
-  var offset = start
-  let endOffset = start + length
+/// Powers of ten that are exactly representable as a `Double`
+private let exactPowersOfTen: [Double] = [
+  1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+  1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+]
 
-  var result = 0
-  while offset < endOffset, span[offset].isDigit {
-    result &*= 10
-    result &+= numericCast(span[offset] &- .zero)
-    offset += 1
+/// Parses the number literal of `length` bytes that `byteAt` gives access to
+@inline(__always)
+private func parseDouble(length: Int, byteAt: (Int) -> UInt8) -> Double {
+  var offset = 0
+  var negative = false
+
+  if length > 0, byteAt(0) == .minus || byteAt(0) == .plus {
+    negative = byteAt(0) == .minus
+    offset = 1
   }
-  return Double(result)
-}
 
-private func strtodSpan(_ span: Span<UInt8>, start: Int, length: Int) -> Double {
-  var offset = start
-  let endOffset = start + length
-  var notAtEnd: Bool { offset < endOffset }
+  let digitsStart = offset
+  var significand: UInt64 = 0
+  var exponent = 0
+
+  // Larger significands may not fit a `Double` exactly, so they don't need to be complete
+  let maxSignificand: UInt64 = 1 << 53
+  func append(_ digit: UInt8) {
+    if significand <= maxSignificand {
+      significand = significand &* 10 &+ UInt64(digit &- .zero)
+    }
+  }
+
+  while offset < length, byteAt(offset).isDigit {
+    append(byteAt(offset))
+    offset &+= 1
+  }
+
+  if offset < length, byteAt(offset) == .fullStop {
+    offset &+= 1
+
+    while offset < length, byteAt(offset).isDigit {
+      append(byteAt(offset))
+      exponent &-= 1
+      offset &+= 1
+    }
+  }
+
+  let digitsEnd = offset
+
+  if offset < length, byteAt(offset) == .e || byteAt(offset) == .E {
+    offset &+= 1
+    var explicitExponent = 0
+    var exponentIsNegative = false
+
+    if offset < length, byteAt(offset) == .minus || byteAt(offset) == .plus {
+      exponentIsNegative = byteAt(offset) == .minus
+      offset &+= 1
+    }
+
+    while offset < length, byteAt(offset).isDigit {
+      // Anything this large is infinite or zero, whatever the digits are
+      if explicitExponent < 1_000_000_000 {
+        explicitExponent = explicitExponent &* 10 &+ Int(byteAt(offset) &- .zero)
+      }
+      offset &+= 1
+    }
+
+    exponent &+= exponentIsNegative ? 0 &- explicitExponent : explicitExponent
+  }
 
   var result: Double
-  var base = 0
-  var sign: Double = 1
-
-  switch span[offset] {
-  case .minus:
-    sign = -1
-    offset += 1
-  case .plus:
-    sign = 1
-    offset += 1
-  default:
-    ()
-  }
-
-  while notAtEnd, span[offset].isDigit {
-    base &*= 10
-    base &+= numericCast(span[offset] &- .zero)
-    offset += 1
-  }
-
-  result = Double(base)
-
-  guard notAtEnd else {
-    return result * sign
-  }
-
-  if span[offset] == .fullStop {
-    offset += 1
-
-    var fraction = 0
-    var divisor = 1
-
-    while notAtEnd, span[offset].isDigit {
-      fraction &*= 10
-      fraction &+= numericCast(span[offset] &- .zero)
-      divisor &*= 10
-      offset += 1
+  if significand <= maxSignificand, exponent >= -22, exponent <= 22 {
+    // One operation on two exact values is correctly rounded
+    result = Double(significand)
+    if exponent < 0 {
+      result /= exactPowersOfTen[0 &- exponent]
+    } else {
+      result *= exactPowersOfTen[exponent]
     }
-
-    result += Double(fraction) / Double(divisor)
-
-    guard notAtEnd else {
-      return result * sign
+  } else {
+    var literal = [UInt8]()
+    literal.reserveCapacity(length &+ 12)
+    for i in digitsStart..<digitsEnd where byteAt(i) != .fullStop {
+      literal.append(byteAt(i))
     }
+    literal.append(.e)
+    literal.append(contentsOf: String(exponent).utf8)
+    result = Double(String(decoding: literal, as: UTF8.self)) ?? 0
   }
 
-  guard span[offset] == .e || span[offset] == .E else {
-    return result * sign
-  }
-
-  offset += 1
-  var exponent = 0
-  var exponentSign = 1
-
-  guard notAtEnd else {
-    return result * sign
-  }
-
-  switch span[offset] {
-  case .minus:
-    exponentSign = -1
-    offset += 1
-  case .plus:
-    exponentSign = 1
-    offset += 1
-  default:
-    ()
-  }
-
-  while notAtEnd, span[offset].isDigit {
-    exponent &*= 10
-    exponent &+= numericCast(span[offset] &- .zero)
-    offset += 1
-  }
-  exponent *= exponentSign
-  result *= pow(10, Double(exponent))
-
-  return result * sign
-}
-
-// MARK: - Array-based strtoi/strtod
-
-private func strtoiArray(_ bytes: [UInt8], start: Int, length: Int) -> Double {
-  var offset = start
-  let endOffset = start + length
-
-  var result = 0
-  while offset < endOffset, bytes[offset].isDigit {
-    result &*= 10
-    result &+= numericCast(bytes[offset] &- .zero)
-    offset += 1
-  }
-  return Double(result)
-}
-
-private func strtodArray(_ bytes: [UInt8], start: Int, length: Int) -> Double {
-  var offset = start
-  let endOffset = start + length
-  var notAtEnd: Bool { offset < endOffset }
-
-  var result: Double
-  var base = 0
-  var sign: Double = 1
-
-  switch bytes[offset] {
-  case .minus:
-    sign = -1
-    offset += 1
-  case .plus:
-    sign = 1
-    offset += 1
-  default:
-    ()
-  }
-
-  while notAtEnd, bytes[offset].isDigit {
-    base &*= 10
-    base &+= numericCast(bytes[offset] &- .zero)
-    offset += 1
-  }
-
-  result = Double(base)
-
-  guard notAtEnd else {
-    return result * sign
-  }
-
-  if bytes[offset] == .fullStop {
-    offset += 1
-
-    var fraction = 0
-    var divisor = 1
-
-    while notAtEnd, bytes[offset].isDigit {
-      fraction &*= 10
-      fraction &+= numericCast(bytes[offset] &- .zero)
-      divisor &*= 10
-      offset += 1
-    }
-
-    result += Double(fraction) / Double(divisor)
-
-    guard notAtEnd else {
-      return result * sign
-    }
-  }
-
-  guard bytes[offset] == .e || bytes[offset] == .E else {
-    return result * sign
-  }
-
-  offset += 1
-  var exponent = 0
-  var exponentSign = 1
-
-  guard notAtEnd else {
-    return result * sign
-  }
-
-  switch bytes[offset] {
-  case .minus:
-    exponentSign = -1
-    offset += 1
-  case .plus:
-    exponentSign = 1
-    offset += 1
-  default:
-    ()
-  }
-
-  while notAtEnd, bytes[offset].isDigit {
-    exponent &*= 10
-    exponent &+= numericCast(bytes[offset] &- .zero)
-    offset += 1
-  }
-  exponent *= exponentSign
-  result *= pow(10, Double(exponent))
-
-  return result * sign
+  return negative ? -result : result
 }
 
 // MARK: - Array-based makeInt
