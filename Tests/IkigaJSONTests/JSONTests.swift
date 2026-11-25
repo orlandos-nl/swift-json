@@ -45,6 +45,38 @@ final class IkigaJSONTests: XCTestCase {
     XCTAssertNoThrow(try IkigaJSONDecoder().decode([UInt64].self, from: json))
   }
 
+  func testDecodeDouble() throws {
+    let literals = [
+      "0", "-0", "7", "-128", "-9007199254740992", "9007199254740993", "90071992547409920",
+      "1234567890123456789", "-18446744073709551616", "12345678901234567890123",
+      "0.1", "-0.1", "-128.0", "179.97800000000001", "0.000000000000000000000000000001",
+      "3.14159265358979323846", "305113796.7869073662585178128",
+      "1e22", "1e23", "-1E-5", "1.5e+3", "239171627001.12345678901234567890e-3",
+      "5e-324", "2.2250738585072014e-308", "1.7976931348623157e308", "1e-400",
+    ]
+    let json = "[" + literals.joined(separator: ",") + "]"
+    let expected = literals.map { Double($0)!.bitPattern }
+
+    let decoded = try newParser.decode([Double].self, from: Data(json.utf8))
+    XCTAssertEqual(decoded.map(\.bitPattern), expected)
+
+    struct Value: Decodable {
+      let value: Double
+    }
+    for literal in literals {
+      let keyed = try newParser.decode(Value.self, from: Data("{\"value\":\(literal)}".utf8))
+      XCTAssertEqual(keyed.value.bitPattern, Double(literal)!.bitPattern, literal)
+      let single = try newParser.decode(Double.self, from: Data(literal.utf8))
+      XCTAssertEqual(single.bitPattern, Double(literal)!.bitPattern, literal)
+    }
+
+    XCTAssertEqual(try newParser.decode([Float].self, from: Data("[-128,0.1]".utf8)), [-128, 0.1])
+
+    let array = try JSONArray(data: Data("[3.14159265358979323846,-0.1]".utf8))
+    XCTAssertEqual(array[0] as? Double, 3.14159265358979323846)
+    XCTAssertEqual(array[1] as? Double, -0.1)
+  }
+
   func testMemoryLeak() throws {
     for _ in 0..<100_000 {
       _ = try! JSONObject(buffer: .init(string: "{}"))
